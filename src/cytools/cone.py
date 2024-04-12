@@ -38,6 +38,10 @@ import ppl
 import qpsolvers
 from scipy import sparse
 from scipy.optimize import nnls
+import scipy as sp
+from gurobipy import *
+from scipy.sparse.linalg import splu
+
 
 # CYTools imports
 from cytools import config
@@ -98,7 +102,7 @@ class Cone:
                  hyperplanes: "ArrayLike"=None,
                  parse_inputs: bool=True,
                  check: bool=True,
-                 copy: bool=True):
+                 copy: bool=True, computeDimension=True):
         """
         **Description:**
         Initializes a `Cone` object.
@@ -156,6 +160,11 @@ class Cone:
             self.clear_cache()
             self._ambient_dim = data.shape[1]
             self._dim = None
+            
+            if isinstance(data, sparse.spmatrix):
+                self._sparse_input = True
+            else:
+                self._sparse_input = False
 
             if self._rays_were_input:
                 self._rays = data
@@ -169,20 +178,37 @@ class Cone:
             self._rays_were_input = False
             self._rays = None
             if copy:
-                data = np.array(hyperplanes)
+                if isinstance(hyperplanes, sparse.spmatrix):
+                    data = sparse.csr_array(hyperplanes.copy())
+                else:
+                    data = np.array(hyperplanes)
             else:
-                data = np.asarray(hyperplanes)
+                if isinstance(hyperplanes, sparse.spmatrix):
+                    data = sparse.csr_array(hyperplanes)
+                else:
+                    data = np.asarray(hyperplanes)
         else:
             data_name = "ray(s)"
             self._rays_were_input = True
             self._hyperplanes = None
             if copy:
-                data = np.array(rays)
+                if isinstance(rays, sparse.spmatrix):
+                    data = sparse.csr_array(rays.copy())
+                else:
+                    data = np.array(rays)
             else:
-                data = np.asarray(rays)
+                if isinstance(rays, sparse.spmatrix):
+                    data = sparse.csr_array(rays)
+                else:
+                    data = np.asarray(rays)
 
         # initialize other variables
         self.clear_cache()
+        
+        if isinstance(data, sparse.spmatrix):
+            self._sparse_input = True
+        else:
+            self._sparse_input = False
 
         # basic data-checking
         if len(data.shape) != 2:
@@ -194,7 +220,7 @@ class Cone:
 
         self._ambient_dim = data.shape[1]
 
-        if len(data):
+        if data.shape[0]:
             # check size of coordinates
             if np.min(data)<=-100000000000000:
                 warnings.warn(f"Extremely small coordinate, {np.min(data)}, "
@@ -223,35 +249,67 @@ class Cone:
 
             # reduce by GCD
             if check or t in (fmpz, np.float64):
-                # get GCDs
-                if t == np.int64:
-                    gcds = np.gcd.reduce(data, axis=1)
+                if self._sparse_input:
+                    #Do this stuff..is not finished yet
+                    if not t == np.int64:
+                        raise NotImplementedError("Non-integer entries for sparse matrices not supported")
+                    if(len(set(data.nonzero()[0])) < data.shape[0]):
+                        warnings.warn("0 gcd found (row of zeroes)...Deleting them!")
+                        data = data[data.getnnz(1)>0]
+                    newData = np.array([])
+                    for j in range(data.shape[0]):
+                        rw = data.getrow(j) #the whole getrow thing is apparently not super efficient...try something zip related?
+                        currentRowData = np.array([rw[0, i] for i in rw.nonzero()[1]])
+                        rowGCD = np.gcd.reduce(currentRowData)
+                        newData = np.append(newData, currentRowData//rowGCD)
+                    data = sparse.csr_array((np.array(newData), (np.array(data.nonzero()[0]), np.array(data.nonzero()[1])))).astype(int)
                 else:
-                    gcds = np.asarray([gcd_list(v) for v in data])
-
-                # reduce by them
-                if t == np.int64:
-                    mask = (gcds > 0)
-                    if False in mask:
-                        warnings.warn("0 gcd found (row of zeros)... "
+                    # get GCDs
+                    if t == np.int64:
+                        gcds = np.gcd.reduce(data, axis=1)
+                    else:
+                        gcds = np.asarray([gcd_list(v) for v in data])
+                    # reduce by them
+                    if t == np.int64:
+                        mask = (gcds > 0)
+                        if False in mask:
+                            warnings.warn("0 gcd found (row of zeros)... "
                                       "Skipping it!")
-                    data = data[mask]//gcds[mask].reshape(-1,1).astype(int)
-                else:
-                    mask = (gcds >= 1e-5)
-                    if False in mask:
-                        warnings.warn("Extremely small gcd found... "
+                        data = data[mask]//gcds[mask].reshape(-1,1).astype(int)
+                    else:
+                        mask = (gcds >= 1e-5)
+                        if False in mask:
+                            warnings.warn("Extremely small gcd found... "
                                       "Computations may be incorrect!")
-                    data = (data[mask]/gcds[mask].reshape(-1,1)).astype(int)
+                        data = (data[mask]/gcds[mask].reshape(-1,1)).astype(int)
             else:
                 data = data.astype(int)
 
         # put data in correct variable
         if self._rays_were_input:
-            self._rays = np.asarray(data)
-            self._dim = np.linalg.matrix_rank(self._rays)
+            if self._sparse_input:
+                self._rays = data
+                if computeDimension:
+                    self._dim = sp.linalg.interpolative.estimate_rank(sparse.linalg.aslinearoperator(data.astype('float64')), 0.01)
+                    warnings.warn("The dimension of a sparse matrix is estimated using random methods. To obtain an exact value, turn it into a numpy array. Note however this does not impact the validity of the is_solid() method, because that is computed using singular value decomposition.")
+                else:
+                    self._dim = None
+                #warnings.warn("The dimension of a sparse matrix is estimated using random methods. To obtain an exact value, turn it into a numpy array.")
+            else:
+                self._rays = np.asarray(data)
+                if computeDimension:
+                    self._dim = np.linalg.matrix_rank(self._rays)
+                else:
+                    self._dim = None
         else:
-            self._hyperplanes = np.asarray(data)
+            if self._sparse_input:
+                self._hyperplanes = sparse.csr_array(data)
+            else:
+                self._hyperplanes = np.asarray(data)
             self._dim = None
+            
+        if self._sparse_input and (data.shape[1] < self._ambient_dim):
+            warnings.warn("Input data ends with column(s) of all zeroes. Be advised that in computations and in data returned these will be deleted. However, the ambient dimension variable reflects the original dimensions of the input data.")
 
     def clear_cache(self):
         """
@@ -314,10 +372,10 @@ class Cone:
         """
         if self._rays is not None:
             return (f"A {self._dim}-dimensional rational polyhedral cone in "
-                    f"RR^{self._ambient_dim} generated by {len(self._rays)} "
+                    f"RR^{self._ambient_dim} generated by {self._rays.shape[0]} "
                     f"rays")
         return (f"A rational polyhedral cone in RR^{self._ambient_dim} "
-                f"defined by {len(self._hyperplanes)} hyperplanes")
+                f"defined by {self._hyperplanes.shape[0]} hyperplanes")
 
     def __eq__(self, other):
         """
@@ -347,23 +405,35 @@ class Cone:
         if not isinstance(other, Cone):
             return NotImplemented
 
-        if (self._rays is not None and other._rays is not None and
-            sorted(self._rays.tolist()) == sorted(other._rays.tolist())):
-            return True
-        if (self._hyperplanes is not None and other._hyperplanes is not None
-                and sorted(self._hyperplanes.tolist()) ==
-                                        sorted(other._hyperplanes.tolist())):
-            return True
+        if (self._rays is not None and other._rays is not None):
+            if (isinstance(self._rays, np.ndarray) and isinstance(other._rays, np.ndarray)):
+                if (sorted(self._rays.tolist()) == sorted(other._rays.tolist())):
+                    return True
+            if (sortRows(sparse.csr_array(self._rays)) == sortRows(sparse.csr_array(other._rays))):
+                return True
+                
+        if (self._hyperplanes is not None and other._hyperplanes is not None):
+            if (isinstance(self._hyperplanes, np.ndarray) and isinstance(other._hyperplanes, np.ndarray)):
+                if (sorted(self._hyperplanes.tolist()) == sorted(other._hyperplanes.tolist())):
+                    return True
+            if (sortRows(sparse.csr_array(self._hyperplanes)) == sortRows(sparse.csr_array(other._hyperplanes))):
+                return True
         if self.is_pointed() ^ other.is_pointed():
             return False
         if self.is_pointed() and other.is_pointed():
-            return (sorted(self.extremal_rays().tolist())
+            if (isinstance(self.extremal_rays(), np.ndarray) and isinstance(other.extremal_rays(), np.ndarray)):
+                return (sorted(self.extremal_rays().tolist())
                     == sorted(other.extremal_rays().tolist()))
+            else:
+                return (sortRows(sparse.csr_array(self.extremal_rays())) == sortRows(sparse.csr_array(other.extremal_rays())))
         if self.dual().is_pointed() ^ other.dual().is_pointed():
             return False
         if self.dual().is_pointed() and other.dual().is_pointed():
-            return (sorted(self.dual().extremal_rays().tolist())
+            if (isinstance(self.dual().extremal_rays(), np.ndarray) and isinstance(other.dual().extremal_rays(), np.ndarray)):
+                return (sorted(self.dual().extremal_rays().tolist())
                     == sorted(other.dual().extremal_rays().tolist()))
+            else:
+                return (sortRows(sparse.csr_array(self.dual().extremal_rays())) == sortRows(sparse.csr_array(other.dual().extremal_rays())))
 
         warnings.warn("The comparison of cones that are not pointed, and "
                       "whose duals are also not pointed, is not supported.")
@@ -427,14 +497,18 @@ class Cone:
         if self._hash is not None:
             return self._hash
         if self.is_pointed():
-            self._hash = hash(tuple(sorted(tuple(v)
-                                           for v in self.extremal_rays())))
+            if self._sparse_input:
+                self._hash = hash(tuple([tuple(v) for v in sortRows(self.extremal_rays())]))
+            else:
+                self._hash = hash(tuple(sorted(tuple(v) for v in self.extremal_rays())))
             return self._hash
         if self.dual().is_pointed():
             # Note: The minus sign is important because otherwise the dual cone
             # would have the same hash.
-            self._hash = -hash(tuple(sorted(tuple(v)
-                                        for v in self.dual().extremal_rays())))
+            if self._sparse_input:
+                self._hash = -hash(tuple([tuple(v) for v in sortRows(self.dual().extremal_rays())]))
+            else:
+                self._hash = -hash(tuple(sorted(tuple(v) for v in self.dual().extremal_rays())))
             return self._hash
 
         warnings.warn("Cones that are not pointed and whose duals are also "
@@ -492,7 +566,15 @@ class Cone:
         if self._dim is not None:
             return self._dim
         if self._rays is not None:
+            if self._sparse_input:
+                self._dim = sp.linalg.interpolative.estimate_rank(sparse.linalg.aslinearoperator(self.rays().astype('float64')), 0.01)
+                warnings.warn("Dimension of sparse matrices determined by random methods")
+                return self._dim
             self._dim = np.linalg.matrix_rank(self._rays)
+            return self._dim
+        if self._sparse_input:
+            self._dim = sp.linalg.interpolative.estimate_rank(sparse.linalg.aslinearoperator(self.rays().astype('float64')), 0.01)
+            warnings.warn("Dimension of sparse matrices determined via random methods.")
             return self._dim
         self._dim = np.linalg.matrix_rank(self.rays())
         return self._dim
@@ -508,7 +590,9 @@ class Cone:
         None.
 
         **Returns:**
-        *(numpy.ndarray)* The list of rays that generate the cone.
+        *(numpy.ndarray)* The list of rays that generate the cone (provided the initial list of rays or hyperplanes was not a sparse matrix)
+        *(scipy.sparse.spmatrix)* The matrix of rays that generate the cone (provided the initial list of rays or hyperplanes was a sparse matrix)
+        
 
         **Example:**
         We construct two cones and find their generating rays.
@@ -524,19 +608,30 @@ class Cone:
         ```
         """
         if self._ext_rays is not None:
-            return np.array(self._ext_rays)
+            if self._sparse_input:
+                return sparse.csr_array(self._ext_rays) #not really sure why we cast it as an np.array...
+            else:
+                return np.array(self._ext_rays)
         if self._rays is not None:
-            return np.array(self._rays)
+            if self._sparse_input:
+                return sparse.csr_array(self._rays)
+            else:
+                return np.array(self._rays)
         if (self._ambient_dim >= 12
                 and len(self._hyperplanes) != self._ambient_dim):
             warnings.warn("This operation might take a while for d > ~12 "
                           "and is likely impossible for d > ~18.")
         cs = ppl.Constraint_System()
         vrs = [ppl.Variable(i) for i in range(self._ambient_dim)]
-        for h in self.dual().extremal_rays():
-            cs.insert(
-                sum(h[i]*vrs[i] for i in range(self._ambient_dim)) >= 0 )
-        cone = ppl.C_Polyhedron(cs)
+        if self._sparse_input:
+            for h in range(self.dual().extremal_rays().shape[0]):
+                currRow = self.dual().extremal_rays().getrow(h)
+                cs.insert(sum(currRow[0, i]*vrs[i] for i in currRow.nonzero()[1]) >= 0)
+        else:
+            for h in self.dual().extremal_rays():
+                cs.insert(sum(h[i]*vrs[i] for i in range(self._ambient_dim)) >= 0 )
+                
+        cone = ppl.C_Polyhedron(cs) 
         rays = []
         for gen in cone.minimized_generators():
             if gen.is_ray():
@@ -544,9 +639,15 @@ class Cone:
             elif gen.is_line():
                 rays.append(tuple(int(c) for c in gen.coefficients()))
                 rays.append(tuple(-int(c) for c in gen.coefficients()))
-        self._rays = np.array(rays, dtype=int)
-        self._dim = np.linalg.matrix_rank(self._rays)
-        return np.array(self._rays)
+        
+        if self._sparse_input:
+            self._dim = np.linalg.matrix_rank(np.array(rays, dtype=int))
+            self._rays = sparse.csr_array(rays, dtype=int)
+            return sparse.csr_array(self._rays)
+        else:
+            self._rays = np.array(rays, dtype=int)
+            self._dim = np.linalg.matrix_rank(self._rays)
+            return np.array(self._rays)
 
     def hyperplanes(self):
         """
@@ -559,7 +660,8 @@ class Cone:
 
         **Returns:**
         *(numpy.ndarray)* The list of inward-pointing normals to the
-        hyperplanes that define the cone.
+        hyperplanes that define the cone (provided the initial list of rays or hyperplanes was not sparse).
+        *(scipy.sparse.spmatrix)* The list of inward-pointing normals to the hyperplanes that define the cone (provided the initial list of rays or hyperplanes was sparse).
 
         **Example:**
         We construct two cones and find their hyperplane normals.
@@ -575,28 +677,44 @@ class Cone:
         ```
         """
         if self._hyperplanes is not None:
-            return np.array(self._hyperplanes)
+            if self._sparse_input:
+                return self._hyperplanes
+            else:
+                return np.array(self._hyperplanes)
         if self._ambient_dim >= 12 and len(self.rays()) != self._ambient_dim:
             warnings.warn("This operation might take a while for d > ~12 "
                           "and is likely impossible for d > ~18.")
         gs = ppl.Generator_System()
         vrs = [ppl.Variable(i) for i in range(self._ambient_dim)]
         gs.insert(ppl.point(0))
-        for r in self.extremal_rays():
-            gs.insert(ppl.ray(sum(r[i]*vrs[i]
-                                  for i in range(self._ambient_dim))))
+        
+        if self._sparse_input:
+            sre = self.extremal_rays()
+            for r in range(sre.shape[0]):
+                currentRow = sre.getrow(r)
+                gs.insert(ppl.ray(sum(currentRow[0, i]*vrs[i] for i in currentRow.nonzero()[1]))) #this is really not using the power of sparse matrices :(
+        else:
+            for r in self.extremal_rays():
+                gs.insert(ppl.ray(sum(r[i]*vrs[i] for i in range(self._ambient_dim))))
+        
+        #Not quite sure what is going on here...but it works for now...
         cone = ppl.C_Polyhedron(gs)
         hyperplanes = []
         for cstr in cone.minimized_constraints():
             hyperplanes.append(tuple(int(c) for c in cstr.coefficients()))
             if cstr.is_equality():
                 hyperplanes.append(tuple(-int(c) for c in cstr.coefficients()))
-        self._hyperplanes = np.array(hyperplanes, dtype=int)
-
-        if len(self._hyperplanes)==0:
+        
+        #keep working here...convert to sparse format :)
+        if len(hyperplanes) == 0:
             self._hyperplanes = np.zeros((0,self._ambient_dim), dtype=int)
-
-        return np.array(self._hyperplanes)
+            return np.array(self._hyperplanes)
+        elif self._sparse_input:
+            self._hyperplanes = sparse.csr_array(hyperplanes, dtype = int)
+            return sparse.csr_array(self._hyperplanes)
+        else:
+            self._hyperplanes = np.array(hyperplanes, dtype=int)
+            return np.array(self._hyperplanes)
 
     def contains(self, pt: "list-like", eps: float = 0) -> bool:
         """
@@ -611,7 +729,7 @@ class Cone:
         **Returns:**
         Whether pt is in the (strict) interior.
         """
-        if len(self.hyperplanes()):
+        if self.hyperplanes().shape[0]:
             gaps = pt@self.hyperplanes().T
             return min(gaps) >= eps
         else:
@@ -626,7 +744,7 @@ class Cone:
         None.
 
         **Returns:**
-        *(Cone)* The dual cone.
+        *(Cone)* The dual cone. 
 
         **Aliases:**
         `dual`.
@@ -682,10 +800,28 @@ class Cone:
         ```
         """
         if self._ext_rays is not None:
-            return np.array(self._ext_rays)
+            if self._sparse_input:
+                return sparse.csr_array(self._ext_rays, copy=True) 
+            else:
+                return np.array(self._ext_rays)
 
         # It is important to delete duplicates
-        rays = np.array(list({tuple(r) for r in self.rays()}))
+        rays = None
+        if self._sparse_input:
+            currentRazeData = sortRows(self.rays())
+            
+            duplicateFree = list(set([tuple(j) for j in currentRazeData]))
+            dataData = []
+            rowData = []
+            colData = []
+            for j in range(len(duplicateFree)):
+                for k in range(len(duplicateFree[j])):
+                    rowData.append(j)
+                    colData.append(duplicateFree[j][k][1])
+                    dataData.append(duplicateFree[j][k][0])
+            rays = sparse.csr_array((np.array(dataData), (np.array(rowData), np.array(colData))))
+        else:
+            rays = np.array(list({tuple(r) for r in self.rays()}))
 
         # configure threads
         n_threads = config.n_threads
@@ -707,7 +843,7 @@ class Cone:
         failed_after_rechecking = False
         while True:
             checking = []
-
+            
             # fill list of rays that we're currently checking
             for i in current_rays:
                 if (i not in ext_rays
@@ -715,7 +851,7 @@ class Cone:
                     checking.append(i)
                 if len(checking) >= n_threads:
                     break
-
+            
             if len(checking) == 0:
                 if rechecking_rays:
                     break
@@ -723,21 +859,38 @@ class Cone:
 
             # check each ray (using multiple threads)
             q = Queue()
-
-            As = [np.array([rays[j] for j in current_rays if j!=k],dtype=int).T
+            
+            As = None
+            bs = None
+            if self._sparse_input:
+                As = []
+                bs = []
+                for k in checking:
+                    temporaryMatrix = [rays.getrow(j) for j in current_rays if j !=k]
+                    if len(temporaryMatrix) > 0:
+                        As.append(sparse.vstack(temporaryMatrix, dtype=int).T)
+                    else:
+                        As.append([])
+                    bs.append(rays.getrow(k))
+                
+            else:
+                As = [np.array([rays[j] for j in current_rays if j!=k],dtype=int).T
                     for k in checking]
-            bs = [rays[k] for k in checking]
+                bs = [rays[k] for k in checking]
 
+            #print("As " + str(As))
+            #print("Bs " + str(bs))
+            
             procs = [Process(target=is_extremal,
                      args=(As[k],bs[k],k,q,tol)) for k in range(len(checking))]
-
+            
             for t in procs:
                 t.start()
             for t in procs:
                 t.join()
 
             results = [q.get() for j in range(len(checking))]
-
+            
             # parse results
             for res in results:
                 if res[1] is None:
@@ -764,8 +917,14 @@ class Cone:
         if failed_after_rechecking:
             warnings.warn("Minimization failed after multiple attempts. "
                           "Some rays may not be extremal.")
-
-        self._ext_rays = rays[list(ext_rays),:]
+        if len(ext_rays) == 0:
+            self._ext_rays = []
+            return self._ext_rays
+        
+        if self._sparse_input:
+            self._ext_rays = sparse.vstack([rays.getrow(j) for j in list(ext_rays)])
+        else:
+            self._ext_rays = rays[list(ext_rays),:]
         return self._ext_rays
 
     def extremal_hyperplanes(self, tol=1e-4, verbose=False):
@@ -866,7 +1025,7 @@ class Cone:
             print(f"dimension ({self.ambient_dim()}) of the problem...")
 
         # find the tip of the stretched cone
-        if len(self.hyperplanes()) == 0:
+        if self.hyperplanes().shape[0] == 0:
             # trivial
             return np.ones(self._ambient_dim)
 
@@ -988,10 +1147,13 @@ class Cone:
 
         # If the rays are already computed then this is a simple task
         if self._rays is not None and backend is None:
-            if np.linalg.matrix_rank(self._rays) != self._ambient_dim:
+            if self._sparse_input:
+                if sp.sparse.linalg.svds(self._rays.astype('float64'), k=1, which='SM')[1][0] < 1e-10: #check if the smallest singular value is zero
+                    return None
+            elif np.linalg.matrix_rank(self._rays) != self._ambient_dim:
                 return None
-
-            point = self._rays.sum(axis=0)
+            
+            point = self._rays.sum(axis=0) #This is still a reasonable thing for a sparse matrix, although the point is now no longer sparse
 
             if max(abs(point))>1e-3:
                 point //= gcd_list(point)
@@ -1006,7 +1168,7 @@ class Cone:
                     raise Exception(f"Unexpected error in finding point in cone with rays = {self._rays}")
 
             if not integral:
-                point = point/len(self._rays)
+                point = point/self._rays.shape[0]
 
             return point
 
@@ -1032,7 +1194,7 @@ class Cone:
             return None
 
         # function to take dot products
-        if isinstance(self._hyperplanes, (list, np.ndarray)):
+        if isinstance(self._hyperplanes, (list, np.ndarray, sparse.spmatrix)):
             dot = lambda hp,x: hp.dot(x)
         else:
             dot = lambda hp,x: sum([val*x[ind] for ind,val in hp.items()])
@@ -1201,9 +1363,15 @@ class Cone:
                                                         in range(hp.shape[1])]
 
             # define constraints
-            for v in hp:
-                model.Add(sum(ii*var[i] for i,ii in enumerate(v)) >= 0)
-            model.Add(sum(ii*var[i] for i,ii in enumerate(grading_vector))<= 0)
+            if self._sparse_input:
+                for rw in range(hp.shape[0]):
+                    currentRow = hp.getrow(rw)
+                    model.Add(sum(currentRow[0, cl]*var[cl] for cl in currentRow.nonzero()[1]) >= 0)       
+            else:
+                for v in hp:
+                    model.Add(sum(ii*var[i] for i,ii in enumerate(v)) >= 0)
+                    
+            model.Add(sum(ii*var[i] for i,ii in enumerate(grading_vector))<= 0) #grading vector is numpy vector...so this is fine.
             
             SolutionStorage.on_solution_callback = on_soln_callback_single_pt
             solution_storage = SolutionStorage(var, filter_function,\
@@ -1235,8 +1403,13 @@ class Cone:
                                             for i in range(hp.shape[1])]
 
         # define constraints
-        for h in hp:
-            model.Add(sum(ii*var[i] for i,ii in enumerate(h)) >= 0)
+        if self._sparse_input:
+            for rw in range(hp.shape[0]):
+                currentRow = hp.getrow(rw)
+                model.Add(sum(currentRow[0, cl]*var[cl] for cl in currentRow.nonzero()[1]) >= 0)
+        else:
+            for h in hp:
+                model.Add(sum(ii*var[i] for i,ii in enumerate(h)) >= 0)
 
         soln_deg = sum(ii*var[i] for i,ii in enumerate(grading_vector))
 
@@ -1321,7 +1494,13 @@ class Cone:
         if self._is_solid is not None:
             return self._is_solid
         if self._rays is not None:
-            return np.linalg.matrix_rank(self._rays) == self._ambient_dim
+            if self._sparse_input:
+                if (self.rays().shape[1] < self._ambient_dim) or (self.rays().shape[0] < self._ambient_dim): #i.e. the last column of the vectors is really all zeroes or there are definitely not enough rays to span the ambient space
+                    return False
+                #We know the diagonal will be of length ambient_dimension, and so there are singular values on it iff the dimension spanned is less than the ambient dimension
+                return sp.sparse.linalg.svds(self._rays.astype('float64'), k=1, which='SM')[1][0] > 1e-10 #i.e. the matrix of rays is full rank
+            else:
+                return np.linalg.matrix_rank(self._rays) == self._ambient_dim
 
         # we just have hyperplanes... a bit harder
         backends = (None, "ppl", "glop", "scip", "cpsat", "mosek", "osqp",\
@@ -1335,8 +1514,14 @@ class Cone:
             cs = ppl.Constraint_System()
 
             vrs = [ppl.Variable(i) for i in range(self._ambient_dim)]
-            for h in self._hyperplanes:
-                cs.insert(sum(h[i]*vrs[i] for i in range(self._ambient_dim))\
+            if self._sparse_input:
+                for j in range(self._hyperplanes.shape[0]):
+                    currentRow = self._hyperplanes.getrow(j)
+                    cs.insert(sum(currentRow[0, i]*vrs[i] for i in currentRow.nonzero()[1])\
+                                                                        >= 0)#no clue what this last bit means...
+            else:
+                for h in self._hyperplanes:
+                    cs.insert(sum(h[i]*vrs[i] for i in range(self._ambient_dim))\
                                                                         >= 0)
             cone = ppl.C_Polyhedron(cs)
 
@@ -1429,17 +1614,17 @@ class Cone:
         """
         if self._is_simplicial is not None:
             return self._is_simplicial
-        self._is_simplicial = len(self.extremal_rays()) == self.dim()
+        self._is_simplicial = self.extremal_rays().shape[0] == self.dim()
         return self._is_simplicial
 
-    def is_smooth(self):
+    def is_smooth(self, useLU=False):
         """
         **Description:**
         Returns True if the cone is smooth, i.e. its extremal rays either form a
         basis of the ambient lattice, or they can be extended into one.
 
         **Arguments:**
-        None.
+        -`useLU' *(bool, optional)*: specifies that the determinant used to compute smoothness should use the LU factorization method. This retains sparseness, but is, at least according to limited testing, roughly 4 times slower than switching to a numpy array and computing the determinant there.
 
         **Returns:**
         *(bool)* The truth value of the cone being smooth.
@@ -1461,10 +1646,21 @@ class Cone:
             self._is_smooth = False
             return self._is_smooth
         if self.is_solid():
-            self._is_smooth = (abs(abs(np.linalg.det(self.extremal_rays()))-1)
+            if self._sparse_input:
+                if useLU:
+                    self._is_smooth = (abs(abs(luDet(self.extremal_rays())) - 1) < 1e-4)
+                else:
+                    self._is_smooth = (abs(abs(np.linalg.det(self.extremal_rays().toarray()))-1) < 1e-4)
+            else:
+                self._is_smooth = (abs(abs(np.linalg.det(self.extremal_rays()))-1)
                                                                         < 1e-4)
             return self._is_smooth
-        snf = np.array(fmpz_mat(self.extremal_rays().tolist()).snf().tolist(),
+        snf = None
+        if self._sparse_input:
+            warnings.warn("Computation of Smith Normal Form is currently only implemented with dense matrices")
+            snf = np.array(fmpz_mat(self.extremal_rays.toarray().tolist()).snf().tolist(), dtype=int)
+        else:
+            snf = np.array(fmpz_mat(self.extremal_rays().tolist()).snf().tolist(),
                                                                     dtype=int)
         self._is_smooth = (abs(np.prod([snf[i,i] for i in range(len(snf))]))
                                                                         == 1)
@@ -1500,8 +1696,11 @@ class Cone:
         letters = string.ascii_lowercase
         proj_name = "cytools_" + "".join( random.choice(letters)\
                                                         for i in range(10) )
-
-        rays = self.rays()
+        if self._sparse_input:
+            rays = self.rays().toarray()
+            warnings.warn("This calculation is only implemented for ndarrays, so rays will be converted to ndarray before computation begins")
+        else:
+            rays = self.rays()
         with open(f"/dev/shm/{proj_name}.in", "w+") as f:
             f.write(f"amb_space {rays.shape[1]}\ncone {rays.shape[0]}\n")
             f.write(str(rays.tolist()).replace("],","\n").replace(",","").replace("[","").replace("]","")+"\n")
@@ -1555,7 +1754,7 @@ class Cone:
             intersected, or a list of cones to intersect with.
 
         **Returns:**
-        *(Cone)* The cone that results from the intersection.
+        *(Cone)* The cone that results from the intersection. The cone's hyperplanes are given as a sparse array unless all of the input cones' hyperplanes were given as ndarrays, in which case the cone's hyperplanes are given as an ndarray.
 
         **Example:**
         We construct two cones and find their intersection.
@@ -1569,17 +1768,38 @@ class Cone:
         ```
         """
         if isinstance(other, Cone):
-            return Cone(hyperplanes=self.hyperplanes().tolist()
+            if isinstance(other.hyperplanes(), np.ndarray) and isinstance(self.hyperplanes(), np.ndarray):
+                return Cone(hyperplanes=self.hyperplanes().tolist()
                             + other.hyperplanes().tolist() )
-
-        hyperplanes = self.hyperplanes().tolist()
-        for c in other:
-            if not isinstance(c, Cone):
-                raise ValueError("Elements of the list must be Cone objects.")
-            if c.ambient_dim() != self.ambient_dim():
-                raise ValueError("Ambient lattices must have the same"
+            else: #if one is a sparse array, we really want everything to be sparse, no?
+                ownHyperplanes = sparse.csr_array(self.hyperplanes())
+                otherHyperplanes = sparse.csr_array(other.hyperplanes())
+                return Cone(hyperplanes=sparse.vstack([ownHyperplanes, otherHyperplanes]))
+        
+        doAsNumpy = all([isinstance(self.hyperplanes(), np.ndarray)]+[isinstance(c.hyperplanes(), np.ndarray) for c in other])
+        
+        if doAsNumpy:
+            hyperplanes = self.hyperplanes().tolist()
+            for c in other:
+                planesToIntersect = None
+                if not isinstance(c, Cone):
+                    raise ValueError("Elements of the list must be Cone objects.")
+                if c.ambient_dim() != self.ambient_dim():
+                    raise ValueError("Ambient lattices must have the same"
                                  "dimension.")
-            hyperplanes.extend(c.hyperplanes().tolist())
+                hyperplanes.extend(c.hyperplanes().tolist())
+        else:
+            planeList = [sparse.csr_array(self.hyperplanes())]
+            for c in other:
+                if not isinstance(c, Cone):
+                    raise ValueError("Elements of the list must be Cone objects.")
+                if c.ambient_dim() != self.ambient_dim():
+                    raise ValueError("Ambient lattices must have the same"
+                                 "dimension.")
+                planeList.append(sparse.csr_array(c.hyperplanes()))
+            hyperplanes = sparse.vstack(planeList)
+        
+            
         return Cone(hyperplanes=hyperplanes)
 
 
@@ -1616,7 +1836,11 @@ def is_extremal(A, b, i=None, q=None, tol=1e-4):
     ```
     """
     try:
-        v = nnls(A,b)
+        v = None
+        if self._sparse_input:
+            v = gurobiNNLS(A, b)
+        else:
+            v = nnls(A,b)
         is_ext = abs(v[1]) > tol
         if q is not None:
             q.put((i, is_ext))
@@ -1645,14 +1869,17 @@ def feasibility(hyperplanes: "ArrayLike",
     **Returns:**
     A feasible point, if it exists. Else, None.
     """
-    if isinstance(hyperplanes, (list, np.ndarray)):
+    if isinstance(hyperplanes, sparse.spmatrix):
+        hyperplanes = sparse.csr_array(hyperplanes) #what if we try this instead of equals self? Better.
+        hp_iter = None
+    elif isinstance(hyperplanes, (list, np.ndarray)):
         hyperplanes = np.asarray(hyperplanes)
         hp_iter = enumerate
     else:
         hp_iter = lambda hp:hp.items()
 
     # accomodate trivial hyperplanes
-    if len(hyperplanes)==0:
+    if hyperplanes.shape[0]==0:
         return np.ones(ambient_dim)
 
     if backend in ("glop", "scip"):
@@ -1671,16 +1898,24 @@ def feasibility(hyperplanes: "ArrayLike",
 
         # define constraints
         cons_list = []
-        for v in hyperplanes:
-            cons_list.append(solver.Constraint(c, solver.infinity()))
-            for ind,val in hp_iter(v):
-                cons_list[-1].SetCoefficient(var[ind], float(val))
+        if isinstance(hyperplanes, sparse.spmatrix):
+            for rose in range(hyperplanes.shape[0]):
+                cons_list.append(solver.Constraint(c, solver.infinity()))
+                currentRow = hyperplanes.getrow(rose)
+                for j in currentRow.nonzero()[1]:
+                    cons_list[-1].SetCoefficient(var[j], float(currentRow[0, j]))
+        else:
+            for v in hyperplanes:
+                cons_list.append(solver.Constraint(c, solver.infinity()))
+                for ind,val in hp_iter(v):
+                    cons_list[-1].SetCoefficient(var[ind], float(val))
 
         # define objective
         obj = solver.Objective()
         obj.SetMinimization()
-
-        obj_vec = hyperplanes.sum(axis=0)/len(hyperplanes)
+        
+        obj_vec = hyperplanes.sum(axis=0)/hyperplanes.shape[0]
+        
         for i in range(ambient_dim):
             obj.SetCoefficient(var[i], obj_vec[i])
 
@@ -1703,7 +1938,7 @@ def feasibility(hyperplanes: "ArrayLike",
                 "NOT_SOLVED"]
             warnings.warn(f"Solver returned status {status_list[status]}.")
             return None
-
+        
     elif backend=="cpsat":
         solver = cp_model.CpSolver()
         model = cp_model.CpModel()
@@ -1713,14 +1948,18 @@ def feasibility(hyperplanes: "ArrayLike",
         for i in range(ambient_dim):
             var.append(model.NewIntVar(cp_model.INT32_MIN,\
                                             cp_model.INT32_MAX, f"x_{i}"))
-
+            
         # define constraints
-        for v in hyperplanes:
-            model.Add(sum(ii*var[i] for i,ii in enumerate(v)) >= c)
+        if isinstance(hyperplanes, sparse.spmatrix):
+            for rose in range(hyperplanes.shape[0]):
+                model.Add(sum(hyperplanes[rose, cls]*var[cls] for cls in hyperplanes.getrow(rose).nonzero()[1]) >= c)
+        else:
+            for v in hyperplanes:
+                model.Add(sum(ii*var[i] for i,ii in enumerate(v)) >= c)
 
         # define objective
         obj_vec = hyperplanes.sum(axis=0)
-        obj_vec //= gcd_list(obj_vec)
+        obj_vec //= gcd_list(obj_vec) #COME BACK TO THIS
 
         obj = 0
         for i in range(ambient_dim):
@@ -1739,3 +1978,69 @@ def feasibility(hyperplanes: "ArrayLike",
                                         f"{solver.StatusName(status)}.")
 
     return solution
+
+def sortRows(mat):
+        """
+        **Description:**
+        A helper method for comparing cones with ==.
+        
+        **Arguments:**
+        A sparse matrix
+        
+        **Returns:**
+        A sorted list of tuples, where each tuple corresponds to the nonzero values and column locations of one of the original rows of the sparse matrix
+        """
+        resortList = [[] for j in range(mat.shape[0])]
+        for k in range(len(mat.nonzero()[0])):
+            rw = mat.nonzero()[0][k]
+            cl = mat.nonzero()[1][k]
+            resortList[rw].append(tuple([mat[rw, cl], cl]))
+        afterResorting = sorted(resortList)
+        return afterResorting
+
+def gurobiNNLS(A, b, verbosity=0):
+    """
+    **Description:**
+    An implementation of the solution to the non-negative least squares problem (nnls) via quadratic programming that accepts sparse arrays.
+    This solves argmin_{x \geq 0} ||Ax - b||_2.
+    
+    **Arguments:**
+    Sparse matrices A and b
+    
+    **Returns:**
+    A tuple where the first entry is an numpy array of x, and the second entry is the l2 norm of ||Ax - b||_2
+    
+    """
+    
+    model = Model("NNLS")
+    model.setParam('OutputFlag', verbosity>1)
+
+
+    x = model.addMVar((A.shape[1],),
+                      lb= float(0), ub=float('inf'),
+                      vtype=GRB.CONTINUOUS)
+    
+    model.setMObjective(Q=0.5*A.T @ A, c=-(A.T @ b.T).T.toarray()[0], constant=0, xc=x, sense=GRB.MINIMIZE)
+    model.addConstrs((x[i] >= 0 for i in range(x.shape[0])), name='c2')
+    
+    model.optimize()
+
+    return tuple([x.x, sp.linalg.norm(A@((x.x).T) - b.toarray())]) 
+
+def luDet(M):
+    """
+    **Description:**
+    This is taken from https://stackoverflow.com/questions/19107617/how-to-compute-scipy-sparse-matrix-determinant-without-turning-it-to-dense. It computes the determinant of a sparse matrix M using LU factorization. The advantage is this method retains sparsity, the disadvantage is that this method is roughly 4 times slower than computing the determinant of a dense matrix in numpy.
+    
+    **Arguments:**
+    Sparse matrix M. 
+    
+    """
+    lu = splu(M)
+    diagL = lu.L.diagonal()
+    diagU = lu.U.diagonal()
+    diagL = diagL.astype(np.complex128)
+    diagU = diagU.astype(np.complex128)
+    logdet = np.log(diagL).sum() + np.log(diagU).sum()
+    det = np.exp(logdet) # usually underflows/overflows for large matrices
+    return det
