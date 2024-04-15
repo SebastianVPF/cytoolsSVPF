@@ -609,12 +609,12 @@ class Cone:
         """
         if self._ext_rays is not None:
             if self._sparse_input:
-                return sparse.csr_array(self._ext_rays) #not really sure why we cast it as an np.array...
+                return sparse.csr_array(self._ext_rays, copy=True) 
             else:
                 return np.array(self._ext_rays)
         if self._rays is not None:
             if self._sparse_input:
-                return sparse.csr_array(self._rays)
+                return sparse.csr_array(self._rays, copy=True)
             else:
                 return np.array(self._rays)
         if (self._ambient_dim >= 12
@@ -643,7 +643,7 @@ class Cone:
         if self._sparse_input:
             self._dim = np.linalg.matrix_rank(np.array(rays, dtype=int))
             self._rays = sparse.csr_array(rays, dtype=int)
-            return sparse.csr_array(self._rays)
+            return sparse.csr_array(self._rays, copy=True)
         else:
             self._rays = np.array(rays, dtype=int)
             self._dim = np.linalg.matrix_rank(self._rays)
@@ -678,7 +678,7 @@ class Cone:
         """
         if self._hyperplanes is not None:
             if self._sparse_input:
-                return self._hyperplanes
+                return sparse.csr_array(self._hyperplanes, copy=True)
             else:
                 return np.array(self._hyperplanes)
         if self._ambient_dim >= 12 and len(self.rays()) != self._ambient_dim:
@@ -705,13 +705,12 @@ class Cone:
             if cstr.is_equality():
                 hyperplanes.append(tuple(-int(c) for c in cstr.coefficients()))
         
-        #keep working here...convert to sparse format :)
         if len(hyperplanes) == 0:
             self._hyperplanes = np.zeros((0,self._ambient_dim), dtype=int)
             return np.array(self._hyperplanes)
         elif self._sparse_input:
             self._hyperplanes = sparse.csr_array(hyperplanes, dtype = int)
-            return sparse.csr_array(self._hyperplanes)
+            return sparse.csr_array(self._hyperplanes, copy=True)
         else:
             self._hyperplanes = np.array(hyperplanes, dtype=int)
             return np.array(self._hyperplanes)
